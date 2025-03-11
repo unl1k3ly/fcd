@@ -14,7 +14,7 @@ const {
   GENESIS_ACCOUNT_COUNT
 } = process.env
 
-const CHAIN_ID = process.env.CHAIN_ID || 'pisco-1'
+const CHAIN_ID = process.env.CHAIN_ID || 'phoenix-1'
 const INITIAL_HEIGHT = parseInt(process.env.INITIAL_HEIGHT || '1')
 
 const config = {
@@ -22,8 +22,8 @@ const config = {
   CHAIN_ID,
   INITIAL_HEIGHT,
   SERVER_PORT: SERVER_PORT ? +SERVER_PORT : 3060,
-  LCD_URI: LCD_URI || 'https://pisco-lcd.terra.dev',
-  FCD_URI: FCD_URI || 'https://pisco-fcd.terra.dev',
+  LCD_URI: LCD_URI || 'https://lcd.phoenix-foundation.dev',
+  FCD_URI: FCD_URI || 'https://fcd.phoenix-foundation.dev',
   RPC_URI: RPC_URI || 'http://localhost:26657',
   BANK_WALLETS: BANK_WALLETS ? (JSON.parse(BANK_WALLETS) as string[]) : [],
   TOKEN_NETWORK: TOKEN_NETWORK,
