@@ -1,120 +1,246 @@
-import * as fs from 'fs'
-import * as path from 'path'
+import * as sentry from '@sentry/node'
+import { getMinutes } from 'date-fns'
+import { getRepository, getManager, DeepPartial, EntityManager } from 'typeorm'
 import * as Bluebird from 'bluebird'
-import { EntityManager, In } from 'typeorm'
-import { compact, chunk } from 'lodash'
+import { bech32 } from 'bech32'
 
-import { BlockEntity, TxEntity, AccountTxEntity } from 'orm'
-
-import * as lcd from 'lib/lcd'
+import config from 'config'
+import { BlockEntity, BlockRewardEntity } from 'orm'
+import { splitDenomAndAmount, convertAddressToHex } from 'lib/common'
+import { plus } from 'lib/math'
 import { collectorLogger as logger } from 'lib/logger'
-import { generateAccountTxs } from './accountTx'
+import * as lcd from 'lib/lcd'
+import * as rpc from 'lib/rpc'
+import { getTxHashesFromBlock } from 'lib/tx'
 
-const UNWANTED_HASH_FILE = path.resolve(__dirname, 'unwanted_hashes.json')
+import { collectTxs } from './tx'
+import { collectReward } from './reward'
+import { collectNetwork } from './network'
+import { collectGeneral } from './general'
 
-function getUnwantedHashes(): string[] {
-  if (!fs.existsSync(UNWANTED_HASH_FILE)) {
-    fs.writeFileSync(UNWANTED_HASH_FILE, JSON.stringify({ unwantedHashes: [] }, null, 2))
-  }
-  const data = fs.readFileSync(UNWANTED_HASH_FILE, 'utf-8')
-  return JSON.parse(data).unwantedHashes || []
-}
+const validatorCache = new Map()
 
-function addUnwantedHash(hash: string): void {
-  const unwantedHashes = getUnwantedHashes()
-  if (!unwantedHashes.includes(hash)) {
-    unwantedHashes.push(hash)
-    fs.writeFileSync(UNWANTED_HASH_FILE, JSON.stringify({ unwantedHashes }, null, 2))
-    logger.info(`Added problematic hash to unwanted list: ${hash}`)
-  }
-}
+export async function getValidatorOperatorAddressByConsensusAddress(b64: string, height: string) {
+  const operatorAddress = validatorCache.get(b64)
 
-export async function generateTxEntity(tx: Transaction.LcdTransaction, block: BlockEntity): Promise<TxEntity> {
-  const txEntity = new TxEntity()
-  txEntity.chainId = block.chainId
-  txEntity.hash = tx.txhash.toUpperCase()
-  txEntity.data = await sanitizeTx(tx)
-  txEntity.timestamp = new Date(tx.timestamp)
-  txEntity.block = block
-  return txEntity
-}
-
-// Recursively iterating through the keys of the tx object to find and sanitize unicode characters
-async function sanitizeTx(tx: Transaction.LcdTransaction): Promise<Transaction.LcdTransaction> {
-  function hasUnicodeOrControl(s: string): boolean {
-    // eslint-disable-next-line no-control-regex
-    return /[^\u0020-\u007f]/.test(s)
+  if (operatorAddress) {
+    return operatorAddress
   }
 
-  const iterateTx = (obj: any) => {
-    Object.keys(obj).forEach((key) => {
-      if (typeof obj[key] === 'object' && obj[key] !== null) {
-        iterateTx(obj[key])
-      } else {
-        if (hasUnicodeOrControl(obj[key])) {
-          const b = Buffer.from(obj[key])
-          obj[key] = b.toString('base64')
-        }
+  const bondStatuses: LcdValidatorStatus[] = ['BOND_STATUS_BONDED', 'BOND_STATUS_UNBONDING', 'BOND_STATUS_UNBONDED']
+  for (const status of bondStatuses) {
+    const valsAndCons = await lcd.getValidatorsAndConsensus(status, height)
+
+    valsAndCons.forEach((v) => {
+      if (v.lcdConsensus && v.lcdConsensus.address) {
+        const b64i = Buffer.from(bech32.fromWords(bech32.decode(v.lcdConsensus.address).words)).toString('base64')
+        validatorCache.set(b64i, v.lcdValidator.operator_address)
       }
     })
+    if (validatorCache.has(b64)) {
+      break
+    }
   }
-  iterateTx(tx)
-  return tx
+
+  if (!validatorCache.has(b64)) {
+    throw new Error(`cannot find ${b64} address at height ${height}`)
+  }
+
+  return validatorCache.get(b64)
 }
 
-async function generateTxEntities(txHashes: string[], block: BlockEntity): Promise<TxEntity[]> {
-  const txHashesUnique = [...new Set(txHashes)]
-  const unwantedHashList = getUnwantedHashes()
-
-  const filteredTxHashes = txHashesUnique.filter((txHash) => !unwantedHashList.includes(txHash))
-
-  return Bluebird.map(filteredTxHashes, async (txHash) => {
-    try {
-      const tx = await lcd.getTx(txHash)
-      return generateTxEntity(tx, block)
-    } catch (err) {
-      logger.error(`Error fetching txHash ${txHash}: ${err.message}`)
-      addUnwantedHash(txHash) // Add problematic hash to the unwanted list
-      return null // Skip this transaction
-    }
-  }).filter((txEntity) => txEntity !== null) // Remove null values
-}
-
-export async function collectTxs(mgr: EntityManager, txHashes: string[], block: BlockEntity): Promise<TxEntity[]> {
-  const txEntities = await generateTxEntities(txHashes, block)
-
-  const existingTxs = await mgr.find(TxEntity, { where: { hash: In(txEntities.map((t) => t.hash)) } })
-
-  existingTxs.forEach((e) => {
-    if (!e.data.code) {
-      const idx = txEntities.findIndex((t) => t.hash === e.hash)
-
-      if (idx < 0) {
-        throw new Error('impossible')
-      }
-
-      logger.info(`collectTxs: existing successful tx found: ${e.hash}`)
-      txEntities.splice(idx, 1)
-    }
+async function getLatestIndexedBlock(): Promise<BlockEntity | undefined> {
+  const latestBlock = await getRepository(BlockEntity).find({
+    where: {
+      chainId: config.CHAIN_ID
+    },
+    order: {
+      id: 'DESC'
+    },
+    take: 1
   })
 
-  // Save TxEntity
-  const qb = mgr
-    .createQueryBuilder()
-    .insert()
-    .into(TxEntity)
-    .values(txEntities)
-    .orUpdate(['timestamp', 'data', 'block_id'], ['chain_id', 'hash'])
+  if (!latestBlock || latestBlock.length === 0) {
+    return
+  }
 
-  await qb.execute()
+  return latestBlock[0]
+}
 
-  // Generate and save AccountTxEntities
-  const accountTxs: AccountTxEntity[] = compact(txEntities)
-    .map((txEntity) => generateAccountTxs(txEntity))
-    .flat()
+async function generateBlockEntity(
+  lcdBlock: LcdBlock,
+  blockReward: BlockRewardEntity
+): Promise<DeepPartial<BlockEntity>> {
+  const { chain_id: chainId, height, time: timestamp, proposer_address } = lcdBlock.block.header
 
-  await Bluebird.mapSeries(chunk(accountTxs, 5000), (chunk) => mgr.save(chunk))
+  const blockEntity: DeepPartial<BlockEntity> = {
+    chainId,
+    height: +height,
+    timestamp: new Date(timestamp),
+    reward: blockReward,
+    proposer: await getValidatorOperatorAddressByConsensusAddress(proposer_address, height)
+  }
 
-  logger.info(`collectTxs: ${txEntities.length}, accountTxs: ${accountTxs.length}`)
-  return txEntities
+  return blockEntity
+}
+
+const totalRewardReducer = (acc: DenomMap, item: Coin & { validator: string }): DenomMap => {
+  acc[item.denom] = plus(acc[item.denom], item.amount)
+  return acc
+}
+
+const validatorRewardReducer = (acc: DenomMapByValidator, item: Coin & { validator: string }): DenomMapByValidator => {
+  if (!acc[item.validator]) {
+    acc[item.validator] = {}
+  }
+
+  acc[item.validator][item.denom] = plus(acc[item.validator][item.denom], item.amount)
+  return acc
+}
+
+export async function getBlockReward(height: string): Promise<DeepPartial<BlockRewardEntity>> {
+  const decodedRewardsAndCommission = await rpc.getRewards(height)
+
+  const totalReward = {}
+  const totalCommission = {}
+  const rewardPerVal = {}
+  const commissionPerVal = {}
+
+  decodedRewardsAndCommission &&
+    decodedRewardsAndCommission.forEach((item) => {
+      if (!item.amount) {
+        return
+      }
+
+      if (item.type === 'rewards') {
+        const rewards = item.amount
+          .split(',')
+          .map((amount) => ({ ...splitDenomAndAmount(amount), validator: item.validator }))
+
+        rewards.reduce(totalRewardReducer, totalReward)
+        rewards.reduce(validatorRewardReducer, rewardPerVal)
+      } else if (item.type === 'commission') {
+        const commissions = item.amount
+          .split(',')
+          .map((amount) => ({ ...splitDenomAndAmount(amount), validator: item.validator }))
+
+        commissions.reduce(totalRewardReducer, totalCommission)
+        commissions.reduce(validatorRewardReducer, commissionPerVal)
+      }
+    })
+
+  const blockReward: DeepPartial<BlockRewardEntity> = {
+    reward: totalReward,
+    commission: totalCommission,
+    rewardPerVal,
+    commissionPerVal
+  }
+  return blockReward
+}
+
+export async function saveBlockInformation(
+  lcdBlock: LcdBlock,
+  latestIndexedBlock: BlockEntity | undefined
+): Promise<BlockEntity | undefined> {
+  const height: string = lcdBlock.block.header.height
+  logger.info(`collectBlock: begin transaction for block ${height}`)
+
+  const result: BlockEntity | undefined = await getManager()
+    .transaction(async (mgr: EntityManager) => {
+      // Save block rewards
+      const newBlockReward = await mgr.getRepository(BlockRewardEntity).save(await getBlockReward(height))
+      // Save block entity
+      const newBlockEntity = await mgr
+        .getRepository(BlockEntity)
+        .save(await generateBlockEntity(lcdBlock, newBlockReward))
+      // get block tx hashes
+      const txHashes = getTxHashesFromBlock(lcdBlock)
+
+      const unwantedHashList = [
+        "54C3574D13BB7F4DA73E6979B2EB8D7058340CB372B9F44980F731AD968706BF",
+        "58748B409E0ABBCFE066FB0B858BC3CFE9349951B9DF228A8A4FA2FD9C5FC433"
+      ];
+
+      if (txHashes.length) {
+        // Filter out unwanted transaction hashes
+        const filteredTxHashes = txHashes.filter(txHash => !unwantedHashList.includes(txHash));
+
+        if (filteredTxHashes.length) {
+          // Save transactions, skipping the unwanted ones
+          await collectTxs(mgr, filteredTxHashes, newBlockEntity);
+        } else {
+          console.log("All transactions are in the unwanted hash list, skipping save.");
+        }
+      }
+
+      // if (txHashes.length) {
+      //   // save transactions
+      //   await collectTxs(mgr, txHashes, newBlockEntity)
+      // }
+
+      // new block timestamp
+      if (latestIndexedBlock && getMinutes(latestIndexedBlock.timestamp) !== getMinutes(newBlockEntity.timestamp)) {
+        const newBlockTimeStamp = new Date(newBlockEntity.timestamp).getTime()
+
+        await collectReward(mgr, newBlockTimeStamp, height)
+        await collectNetwork(mgr, newBlockTimeStamp, height)
+        await collectGeneral(mgr, newBlockTimeStamp, height)
+      }
+
+      return newBlockEntity
+    })
+    .then((block: BlockEntity) => {
+      logger.info('collectBlock: transaction finished')
+      return block
+    })
+    .catch((err) => {
+      logger.error(err)
+      if (
+        err instanceof Error &&
+        typeof err.message === 'string' &&
+        err.message.includes('transaction not found on node')
+      ) {
+        return undefined
+      }
+      sentry.captureException(err)
+      return undefined
+    })
+  return result
+}
+
+export async function collectBlock(): Promise<void> {
+  let latestHeight
+
+  // Wait until it gets proper block
+  while (!latestHeight) {
+    const latestBlock = await lcd.getLatestBlock()
+
+    if (latestBlock?.block) {
+      latestHeight = Number(latestBlock.block.header.height)
+      break
+    }
+
+    logger.info('collectBlock: waiting for the first block')
+    await Bluebird.delay(1000)
+  }
+
+  let latestIndexedBlock = await getLatestIndexedBlock()
+  let nextSyncHeight = latestIndexedBlock ? latestIndexedBlock.height + 1 : config.INITIAL_HEIGHT
+
+  while (nextSyncHeight <= latestHeight) {
+    const lcdBlock = await lcd.getBlock(nextSyncHeight.toString())
+
+    if (!lcdBlock) {
+      break
+    }
+
+    latestIndexedBlock = await saveBlockInformation(lcdBlock, latestIndexedBlock)
+
+    // Exit the loop after transaction error whether there's more blocks or not
+    if (!latestIndexedBlock) {
+      break
+    }
+
+    nextSyncHeight = nextSyncHeight + 1
+  }
 }
