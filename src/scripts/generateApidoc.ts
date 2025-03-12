@@ -21,7 +21,7 @@ const packageInfo = {
   version: '1.0.0',
   description: 'Terra FCD API Docs',
   title: 'Terra FCD API Docs',
-  url: `${config.FCD_URI}/v1` || 'https://fcd.terra.dev/v1'
+  url: `${config.FCD_URI}/v1` || 'https://fcd.phoenix-foundation.dev/v1'
 }
 
 type UrlItem = {
