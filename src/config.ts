@@ -24,7 +24,7 @@ const config = {
   SERVER_PORT: SERVER_PORT ? +SERVER_PORT : 3060,
   LCD_URI: LCD_URI || 'https://lcd.phoenix-foundation.dev',
   FCD_URI: FCD_URI || 'https://fcd.phoenix-foundation.dev',
-  RPC_URI: RPC_URI || 'http://localhost:26657',
+  RPC_URI: RPC_URI || 'https://rpc.phoenix-foundation.dev',
   BANK_WALLETS: BANK_WALLETS ? (JSON.parse(BANK_WALLETS) as string[]) : [],
   TOKEN_NETWORK: TOKEN_NETWORK,
   SENTRY_DSN,
