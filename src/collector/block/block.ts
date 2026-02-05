@@ -156,27 +156,10 @@ export async function saveBlockInformation(
       // get block tx hashes
       const txHashes = getTxHashesFromBlock(lcdBlock)
 
-      const unwantedHashList = [
-        "54C3574D13BB7F4DA73E6979B2EB8D7058340CB372B9F44980F731AD968706BF",
-        "58748B409E0ABBCFE066FB0B858BC3CFE9349951B9DF228A8A4FA2FD9C5FC433"
-      ];
-
       if (txHashes.length) {
-        // Filter out unwanted transaction hashes
-        const filteredTxHashes = txHashes.filter(txHash => !unwantedHashList.includes(txHash));
-
-        if (filteredTxHashes.length) {
-          // Save transactions, skipping the unwanted ones
-          await collectTxs(mgr, filteredTxHashes, newBlockEntity);
-        } else {
-          console.log("All transactions are in the unwanted hash list, skipping save.");
-        }
+        // save transactions (unfound txs are skipped in collectTxs)
+        await collectTxs(mgr, txHashes, newBlockEntity)
       }
-
-      // if (txHashes.length) {
-      //   // save transactions
-      //   await collectTxs(mgr, txHashes, newBlockEntity)
-      // }
 
       // new block timestamp
       if (latestIndexedBlock && getMinutes(latestIndexedBlock.timestamp) !== getMinutes(newBlockEntity.timestamp)) {
@@ -195,13 +178,6 @@ export async function saveBlockInformation(
     })
     .catch((err) => {
       logger.error(err)
-      if (
-        err instanceof Error &&
-        typeof err.message === 'string' &&
-        err.message.includes('transaction not found on node')
-      ) {
-        return undefined
-      }
       sentry.captureException(err)
       return undefined
     })
